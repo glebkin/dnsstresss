@@ -1,18 +1,39 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/logrusorgru/aurora"
 	"github.com/miekg/dns"
 )
+
+// query is a DNS request query containing domain name and record type
+type query struct {
+	// domain requested by DNS server
+	domain string
+	// recordType is a type of requested DNS record
+	recordType uint16
+}
+
+// Mapping of string record types to its uint16 dns library representation
+var recordTypes = map[string]uint16{
+	"A":    dns.TypeA,
+	"AAAA": dns.TypeAAAA,
+	"ANY":  dns.TypeANY,
+	"MX":   dns.TypeMX,
+	"NS":   dns.TypeNS,
+	"TXT":  dns.TypeTXT,
+}
 
 // Runtime options
 var (
@@ -23,6 +44,14 @@ var (
 	resolver        string
 	randomIds       bool
 	flood           bool
+
+	// Path to file with the list of DNS requests in the following format: <domain> <query-type>
+	// Example:
+	//		6138.7370686f746f73.616b.666263646e.6e6574.80h3f617b3a.webcfs00.com.	MX
+	// 		frycomm.com.s9b2.psmtp.com.	A
+	// 		www.apple.com.	A
+	// 		170.44.153.187.in-addr.arpa.	PTR
+	dataFile string
 )
 
 func init() {
@@ -40,6 +69,8 @@ func init() {
 		"Resolver to test against")
 	flag.BoolVar(&flood, "f", false,
 		"Don't wait for an answer before sending another")
+	flag.StringVar(&dataFile, "dataFile", "",
+		"Path to data file containing DNS requests in format '<domain name> <query type>'")
 }
 
 func main() {
@@ -57,48 +88,68 @@ func main() {
 
 	flag.Parse()
 
-	// We need at least one target domain
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(1)
-	}
-
 	parsedResolver, err := ParseIPPort(resolver)
-	resolver = parsedResolver
 	if err != nil {
 		fmt.Println(aurora.Sprintf(aurora.Red("%s (%s)"), "Unable to parse the resolver address", err))
 		os.Exit(2)
 	}
+	resolver = parsedResolver
 
-	// all remaining parameters are treated as domains to be used in round-robin in the threads
-	targetDomains := make([]string, flag.NArg())
-	for index, element := range flag.Args() {
-		if element[len(element)-1] == '.' {
-			targetDomains[index] = element
-		} else {
-			targetDomains[index] = element + "."
+	var queries []query
+	if dataFile != "" {
+		var f *os.File
+		f, err = os.Open(dataFile)
+		if err != nil {
+			fmt.Println(aurora.Sprintf(aurora.Red("%s (%s)"), "Unable to open dataFile", err))
+			os.Exit(2)
+		}
+		defer f.Close()
+
+		r := bufio.NewReader(f)
+		for {
+			var str string
+			str, err = r.ReadString('\n')
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				fmt.Println(aurora.Sprintf(aurora.Red("%s (%s)"), "Unable to read dataFile", err))
+				os.Exit(2)
+			}
+
+			spl := strings.Fields(str)
+			queries = append(queries, query{
+				domain:     spl[0],
+				recordType: recordTypes[spl[1]],
+			})
 		}
 	}
 
-	fmt.Printf("Testing resolver: %s.\n", aurora.Bold(resolver))
-	fmt.Printf("Target domains: %v.\n\n", targetDomains)
-
-	hasErrors := false
-	for i := range targetDomains {
-		hasErrors = hasErrors || testRequest(targetDomains[i])
+	// all remaining parameters are treated as domains to be used in round-robin in the threads
+	if len(queries) == 0 {
+		for index, element := range flag.Args() {
+			queries[index] = query{
+				domain:     element,
+				recordType: dns.TypeA,
+			}
+		}
 	}
-	if hasErrors {
-		fmt.Printf("%s %s", aurora.BgBrown(" WARNING "), "Could not resolve some domains you provided, you may receive only errors.\n")
+
+	// We need at least one target domain
+	if len(queries) == 0 {
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	// Create a channel for communicating the number of sent messages
 	sentCounterCh := make(chan statsMessage, concurrency)
 
 	// Run concurrently
+	step := len(queries) / concurrency
 	for threadID := 0; threadID < concurrency; threadID++ {
-		go linearResolver(threadID, targetDomains[threadID%len(targetDomains)], sentCounterCh)
+		go linearResolver(threadID, queries[:step], sentCounterCh)
+		queries = queries[step:]
 	}
-	fmt.Print(aurora.Faint(fmt.Sprintf("Started %d threads.\n", concurrency)))
+	fmt.Print(aurora.Faint(fmt.Sprintf("Started %d threads.\n", runtime.NumCPU())))
 
 	if !flood {
 		go timerStats(sentCounterCh)
@@ -109,20 +160,7 @@ func main() {
 	displayStats(sentCounterCh)
 }
 
-func testRequest(domain string) bool {
-	message := new(dns.Msg).SetQuestion(domain, dns.TypeA)
-	if iterative {
-		message.RecursionDesired = false
-	}
-	err := dnsExchange(resolver, message)
-	if err != nil {
-		fmt.Printf("Checking \"%s\" failed: %+v (using %s)\n", domain, aurora.Red(err), resolver)
-		return true
-	}
-	return false
-}
-
-func linearResolver(threadID int, domain string, sentCounterCh chan<- statsMessage) {
+func linearResolver(threadID int, queries []query, sentCounterCh chan<- statsMessage) {
 	// Resolve the domain as fast as possible
 	if verbose {
 		fmt.Printf("Starting thread #%d.\n", threadID)
@@ -133,53 +171,55 @@ func linearResolver(threadID int, domain string, sentCounterCh chan<- statsMessa
 	maxRequestID := big.NewInt(65536)
 	errors := 0
 
-	message := new(dns.Msg).SetQuestion(domain, dns.TypeA)
-	if iterative {
-		message.RecursionDesired = false
-	}
-
 	var start time.Time
 	var elapsed time.Duration    // Total time spent resolving
 	var maxElapsed time.Duration // Maximum time took by a request
 
 	for {
-		for i := 0; i < displayStep; i++ {
-			// Try to resolve the domain
-			if randomIds {
-				// Regenerate message Id to avoid servers dropping (seemingly) duplicate messages
-				newid, _ := rand.Int(rand.Reader, maxRequestID)
-				message.Id = uint16(newid.Int64())
+		for _, q := range queries {
+			message := new(dns.Msg).SetQuestion(q.domain, q.recordType)
+			if iterative {
+				message.RecursionDesired = false
 			}
 
-			if flood {
-				go dnsExchange(resolver, message)
-			} else {
-				start = time.Now()
-				err := dnsExchange(resolver, message)
-				spent := time.Since(start)
-				elapsed += spent
-				if spent > maxElapsed {
-					maxElapsed = spent
+			for i := 0; i < displayStep; i++ {
+				// Try to resolve the domain
+				if randomIds {
+					// Regenerate message Id to avoid servers dropping (seemingly) duplicate messages
+					newid, _ := rand.Int(rand.Reader, maxRequestID)
+					message.Id = uint16(newid.Int64())
 				}
-				if err != nil {
-					if verbose {
-						fmt.Printf("%s error: %d (%s)\n", domain, err, resolver)
+
+				if flood {
+					go dnsExchange(resolver, message)
+				} else {
+					start = time.Now()
+					err := dnsExchange(resolver, message)
+					spent := time.Since(start)
+					elapsed += spent
+					if spent > maxElapsed {
+						maxElapsed = spent
 					}
-					errors++
+					if err != nil {
+						if verbose {
+							fmt.Printf("%s error: %d (%s)\n", q.domain, err, resolver)
+						}
+						errors++
+					}
 				}
 			}
-		}
 
-		// Update the counter of sent requests and requests
-		sentCounterCh <- statsMessage{
-			sent:       displayStep,
-			err:        errors,
-			elapsed:    elapsed,
-			maxElapsed: maxElapsed,
+			// Update the counter of sent requests and requests
+			sentCounterCh <- statsMessage{
+				sent:       displayStep,
+				err:        errors,
+				elapsed:    elapsed,
+				maxElapsed: maxElapsed,
+			}
+			errors = 0
+			elapsed = 0
+			maxElapsed = 0
 		}
-		errors = 0
-		elapsed = 0
-		maxElapsed = 0
 	}
 }
 
